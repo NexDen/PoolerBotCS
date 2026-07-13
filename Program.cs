@@ -3,8 +3,12 @@ using PoolerBotCS;
 using PoolerBotCS.Services;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddHostedService<IrcBotService>();
+builder.Services.AddSingleton<IrcBotService>();
+builder.Services.AddSingleton<IIrcBotService>(sp => sp.GetRequiredService<IrcBotService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<IrcBotService>());
 builder.Services.AddHostedService<DiscordBotService>();
+builder.Services.AddTransient<IBanchoLobbyService, BanchoLobbyService>();
+builder.Services.AddTransient<IBanchoPlayerService, BanchoPlayerService>();
 
 builder.Services.AddDbContext<PoolerDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));

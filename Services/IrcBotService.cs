@@ -5,7 +5,7 @@ using PoolerBotCS.Models;
 
 namespace PoolerBotCS.Services;
 
-public class IrcBotService : BackgroundService
+public class IrcBotService : BackgroundService, IIrcBotService
 {
     private string  _host;
     private int     _port;
@@ -19,9 +19,10 @@ public class IrcBotService : BackgroundService
     private bool _isConnected       = false;
     private bool _isAuthenticated   = false;
     private StreamWriter? _writer;
-    
-    
-    public IrcBotService(IConfiguration config)
+    private StreamReader? _reader;
+    private readonly IServiceProvider _serviceProvider;
+
+    public IrcBotService(IConfiguration config, IServiceProvider serviceProvider)
     {
         _host        = config["Irc:Host"] ?? "";
         _port        = config.GetValue<int>("Irc:Port");
@@ -31,8 +32,7 @@ public class IrcBotService : BackgroundService
         _prefix      = config["Irc:Prefix"] ?? "";
         _baseChannel = "#osu";
         client = new TcpClient();
-        
-        
+        _serviceProvider = serviceProvider;
     }
 
     protected override async Task<Task> ExecuteAsync(CancellationToken stoppingToken)
@@ -48,7 +48,7 @@ public class IrcBotService : BackgroundService
             stream = sslStream;
         }
         
-        var reader = new StreamReader(stream);
+        _reader = new StreamReader(stream);
         _writer = new StreamWriter(stream);
         _writer.AutoFlush = true;
         _writer.NewLine = "\r\n";
@@ -63,7 +63,7 @@ public class IrcBotService : BackgroundService
         
         while (!stoppingToken.IsCancellationRequested)
         {
-            var line = await reader.ReadLineAsync(stoppingToken); // read server messages continuously
+            var line = await _reader.ReadLineAsync(stoppingToken); // read server messages continuously
             if (line is null) break; // closed connection
 
             if (line.StartsWith("PING"))
@@ -72,15 +72,13 @@ public class IrcBotService : BackgroundService
                 await _writer.WriteLineAsync($"PONG {payload}");
                 continue;
             }
-            
-            var (_, command, _) = line.Split(" ");
-            // ^^ fucky c# logic
 
-            
-            
+            var message = ParseMessage(line);
+            var channelId = message.Parameters[1];
+            channelId = channelId.StartsWith(':') ? channelId[1..] : channelId;
             LogMessage(line);
             
-            switch (command)
+            switch (message.Command)
             {
                 case "376": // RPL_ENDOFMOTD
                     // osu!irc never sends 376 if the authentication is wrong for any reason,
@@ -89,6 +87,7 @@ public class IrcBotService : BackgroundService
                     // is wrong, but that message is not guaranteed.
                     _isAuthenticated = true;
                     Log($"Authentication successful!");
+                    await SendMessage("BanchoBot", "!mp make testLobby");
                     break;
                 
                 case "464": // ERR_PASSWDMISMATCH
@@ -98,6 +97,24 @@ public class IrcBotService : BackgroundService
                 case "001": // RPL_WELCOME 
                     _isConnected = true;
                     Log($"Connected to {_host}:{_port}!");
+                    break;
+                
+                case "MODE": // sent when a new channel is created.
+                    
+                    using (var scope = _serviceProvider.CreateScope())
+                    {
+                        var banchoLobbyService = scope.ServiceProvider.GetRequiredService<IBanchoLobbyService>();
+                        banchoLobbyService.Create(channelId);
+                    }
+                    break;
+                
+                case "JOIN":
+                    using (var scope = _serviceProvider.CreateScope())
+                    {
+                        var banchoLobbyService = scope.ServiceProvider.GetRequiredService<IBanchoLobbyService>();
+                        banchoLobbyService.PlayerJoinLobby(channelId, message.Username);
+                    }
+
                     break;
             }
             
@@ -124,14 +141,11 @@ public class IrcBotService : BackgroundService
         await _writer.WriteLineAsync($"PRIVMSG {channel} {message}");
     }
     
+    
 
 
     // users prefixed with "+" are connected via external IRC,
-    // and users prefixed with "@" are GMTs. "+" really won't
-    // affect this program since realistically we won't have 
-    // someone playing pooler from IRC, but "@" will be a problem
-    // if Zeus decided to play the game.
-    // addendum: zeus is not a gmt anymore...
+    // and users prefixed with "@" are GMTs.
     private static string CleanUsername(string username)
     {
         if (username.StartsWith('+') || username.StartsWith('@'))
@@ -141,25 +155,47 @@ public class IrcBotService : BackgroundService
 
         return username;
     }
+
+    private static IRCMessage ParseMessage(string message)
+    {
+        var (source, command, parameters) = message.Split(" ");
+        
+        var (username, _) = source.Split("!"); // 2nd param is always the hostname, can be ignored
+
+        return new IRCMessage()
+        {
+            Command = command,
+            Parameters = parameters,
+            Username = username
+        };
+    }
     
-    private static void LogMessage(string message, bool ignoreCrap = true)
+    
+    private static void LogMessage(string message, bool ignoreCrap = true, bool ignoreOsu = true)
     {
         var (source, command, parameters) = message.Split(" ");
         
         var (username, _) = source.Split("!"); // 2nd param is always the hostname, can be ignored
         username = CleanUsername(username);
+
+        var (_, channel, messages) = parameters;
+
+        channel = channel.StartsWith(':') ? channel[1..] : channel; // trim leading ":"
+        
+        if (ignoreOsu && (channel == "#osu" || parameters[1] == ":#osu")) return;
         
         // QUIT sent whenever someone leaves the server (at least 10 per second lmao)
         // 372 = motd, 375 = motd start, we capture motd end
         if (ignoreCrap && 
             command is 
                 "QUIT" or "372" or "375" or 
-                "JOIN" or "PART" or // a lot per second, really
                 "353" or "366"
            ) return;
+        
         if (command is "PRIVMSG")
         {
-            Log($"{username}: {string.Join(" ", parameters)}");
+            Log(source, command, parameters);
+            //Log($"{username}: {string.Join(" ", parameters)}");
         }
         else
         {
@@ -167,6 +203,9 @@ public class IrcBotService : BackgroundService
         }
         
     }
+
+    
+    
     
     
     private static void Log(params object?[] parameters)
@@ -192,8 +231,7 @@ public class IrcBotService : BackgroundService
 
 public class IRCMessage
 {
-    public string   Tags        { get; set; }
-    public string   Source      { get; set; }
+    public string   Username    { get; set; }
     public string   Command     { get; set; }
     public string[] Parameters  { get; set; }
 }
