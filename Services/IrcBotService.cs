@@ -22,6 +22,9 @@ public class IrcBotService : BackgroundService, IIrcBotService
     private StreamReader? _reader;
     private readonly IServiceProvider _serviceProvider;
 
+    private readonly List<PendingBanchoResponse> _pendingBanchoResponses = new();
+    private readonly object _pendingBanchoResponsesLock = new();
+
     public IrcBotService(IConfiguration config, IServiceProvider serviceProvider)
     {
         _host        = config["Irc:Host"] ?? "";
@@ -69,7 +72,7 @@ public class IrcBotService : BackgroundService, IIrcBotService
             if (line.StartsWith("PING"))
             {
                 var payload = line.Substring("PING ".Length);
-                await _writer.WriteLineAsync($"PONG {payload}");
+                await _writer.WriteLineAsync($"PONG {payload}"); // we have to respond to pings with the same message
                 continue;
             }
 
@@ -87,7 +90,6 @@ public class IrcBotService : BackgroundService, IIrcBotService
                     // is wrong, but that message is not guaranteed.
                     _isAuthenticated = true;
                     Log($"Authentication successful!");
-                    await SendMessage("BanchoBot", "!mp make testLobby");
                     break;
                 
                 case "464": // ERR_PASSWDMISMATCH
@@ -116,6 +118,14 @@ public class IrcBotService : BackgroundService, IIrcBotService
                     }
 
                     break;
+
+                case "PRIVMSG":
+                    if (message.Username == "BanchoBot")
+                    {
+                        DispatchBanchoBotMessage(channelId, message);
+                    }
+
+                    break;
             }
             
             
@@ -139,9 +149,59 @@ public class IrcBotService : BackgroundService, IIrcBotService
     {
         if (_writer is null) throw new InvalidOperationException("IRC connection is not established yet.");
         await _writer.WriteLineAsync($"PRIVMSG {channel} {message}");
+        Log("<<", $"PRIVMSG {channel} {message}");
     }
-    
-    
+
+    public async Task<List<string>> SendMessageAndCollectResponses(string channel, string message, int lineCount, TimeSpan? timeout = null)
+    {
+        if (lineCount <= 0) throw new ArgumentOutOfRangeException(nameof(lineCount));
+
+        var pending = new PendingBanchoResponse(channel, lineCount);
+        lock (_pendingBanchoResponsesLock)
+        {
+            _pendingBanchoResponses.Add(pending);
+        }
+
+        try
+        {
+            await SendMessage(channel, message);
+
+            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(10));
+            await using var registration = cts.Token.Register(() => pending.Tcs.TrySetException(
+                new TimeoutException($"Timed out waiting for {lineCount} line(s) from BanchoBot in {channel}.")));
+
+            return await pending.Tcs.Task;
+        }
+        finally
+        {
+            lock (_pendingBanchoResponsesLock)
+            {
+                _pendingBanchoResponses.Remove(pending);
+            }
+        }
+    }
+
+    private void DispatchBanchoBotMessage(string channel, IRCMessage message)
+    {
+        var text = string.Join(" ", message.Parameters[2..]);
+        text = text.StartsWith(':') ? text[1..] : text;
+
+        lock (_pendingBanchoResponsesLock)
+        {
+            var pending = _pendingBanchoResponses.FirstOrDefault(p => p.Channel == channel && p.LinesRemaining > 0);
+            if (pending is null) return;
+
+            pending.Lines.Add(text);
+            pending.LinesRemaining--;
+
+            if (pending.LinesRemaining == 0)
+            {
+                pending.Tcs.TrySetResult(new List<string>(pending.Lines));
+            }
+        }
+    }
+
+
 
 
     // users prefixed with "+" are connected via external IRC,
@@ -199,7 +259,7 @@ public class IrcBotService : BackgroundService, IIrcBotService
         }
         else
         {
-            Log(source, command, parameters);
+            Log(">>", source, command, parameters);
         }
         
     }
@@ -225,6 +285,20 @@ public class IrcBotService : BackgroundService, IIrcBotService
        }
 
        Console.WriteLine(msgLine);
+    }
+
+    private class PendingBanchoResponse
+    {
+        public PendingBanchoResponse(string channel, int lineCount)
+        {
+            Channel = channel;
+            LinesRemaining = lineCount;
+        }
+
+        public string Channel { get; }
+        public int LinesRemaining { get; set; }
+        public List<string> Lines { get; } = new();
+        public TaskCompletionSource<List<string>> Tcs { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
 
