@@ -15,6 +15,11 @@ public class BanchoLobbyService : IBanchoLobbyService
         _ircBotService = ircBotService;
     }
 
+    public void Make(string name)
+    {
+        _ircBotService.SendMessage("BanchoBot", $"!mp make {name}");
+    }
+    
     public void Create(string lobbyId)
     {
         if (lobbyId == "#osu") return;
@@ -32,7 +37,7 @@ public class BanchoLobbyService : IBanchoLobbyService
         
         _dbContext.SaveChanges();
         
-        InvitePlayer(lobbyId, "Metro_Turizm");
+        //InvitePlayer(lobbyId, "Metro_Turizm");
         Thread.Sleep(5000);
         ChangeMap(lobbyId,"5389812");
     }
@@ -56,14 +61,39 @@ public class BanchoLobbyService : IBanchoLobbyService
     }
 
 
-    public void InvitePlayer(string lobbyId, string playerName)
+    public async Task InvitePlayer(string lobbyId, string playerName)
     {
         var lobby = FindLobby(lobbyId);
         if (lobby == null) return;
-        _ircBotService.SendMessage(lobbyId, $"!mp invite {SanitizeUsername(playerName)}");
+        var response = await SendCommandAndCollectResponses(lobbyId, $"!mp invite {SanitizeUsername(playerName)}");
     }
     
     
+
+    private async Task<List<string>> SendCommandAndCollectResponses(string lobbyId, string message, TimeSpan? timeout = null)
+    {
+        var (_, command, parameters) = message.Split();
+
+        var lineCount = 0;
+
+        var contextLobby = FindLobby(lobbyId);
+        
+        switch (command)
+        {
+            case "addref" or "removeref":
+                lineCount = parameters.Length; // one message per user added/removed
+                break;
+            case "settings":
+                lineCount = 5 + contextLobby?.Players.Count??0; // 5 lines of filler then the player names
+                break;
+            default:
+                lineCount = 1;
+                break;
+        }
+
+        var result = await _ircBotService.SendMessageAndCollectResponses(lobbyId, message, lineCount, timeout);
+        return result;
+    }
 
     private BanchoLobby? FindLobby(string lobbyId)
     {
